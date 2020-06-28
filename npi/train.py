@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 
 import numpy as np
 import tensorflow as tf
@@ -48,12 +49,12 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoint')
     parser.add_argument('--encoder-out', type=str)
     parser.add_argument('--npi-core-out', type=str)
+    parser.add_argument('--adaptive-resampling', action='store_true')
 
     args = parser.parse_args()
 
     examples = json.load(open(args.traindata))
 
-    import random
     random.shuffle(examples)
 
     trace_lens = [len(x['trace']) for x in examples]
@@ -146,73 +147,78 @@ def main():
 
     #return
 
-    model.fit([all_observation_data[:num_train], all_arguments_data[:num_train], all_program_idx_data[:num_train], all_lstm_initial_state_data[:num_train]],
-              [all_stop_data[:num_train], all_next_program_idx_data[:num_train], all_next_arguments_data[:num_train]],
-              validation_data=([all_observation_data[-num_val:], all_arguments_data[-num_val:], all_program_idx_data[-num_val:], all_lstm_initial_state_data[-num_val:]],
-                               [all_stop_data[-num_val:], all_next_program_idx_data[-num_val:], all_next_arguments_data[-num_val:]],
-                               [all_sample_weight[-num_val:]] * len(model.outputs)),
-              epochs=num_epochs, batch_size=batch_size, callbacks=callbacks, verbose=1, sample_weight=[all_sample_weight[:num_train]] * len(model.outputs),
-              steps_per_epoch=None)
+    if args.adaptive_resampling:
+        for epoch in range(num_epochs):
+            observation_data = np.zeros((samples_per_epoch, max_trace_len, *observation_shape))
+            arguments_data = np.zeros((samples_per_epoch, max_trace_len, num_arguments, argument_dim))
+            program_idx_data = np.zeros((samples_per_epoch, max_trace_len))
+            stop_data = np.zeros((samples_per_epoch, max_trace_len, 1))
+            next_program_idx_data = np.zeros((samples_per_epoch, max_trace_len, kv_memory_size))
+            next_arguments_data = np.zeros((samples_per_epoch, max_trace_len, num_arguments, argument_dim))
+            lstm_initial_state_data = np.zeros((samples_per_epoch, lstm_dim))
+            sample_weight = np.zeros((samples_per_epoch, max_trace_len))
 
-    # save model
-    encoder.save(args.encoder_out)
-    npi_core.save(args.npi_core_out)
+            # resample based on weight
+            sampled_idxs = [np.random.choice(range(num_train), p=avg_losses / sum(avg_losses)) for _ in
+                            range(samples_per_epoch)]
+            print('sampled indices/losses', list(zip(sampled_idxs[:10], avg_losses[sampled_idxs[:10]])))
 
-    return
+            for i, j in enumerate(sampled_idxs):
+                observation_data[i] = all_observation_data[j]
+                arguments_data[i] = all_arguments_data[j]
+                program_idx_data[i] = all_program_idx_data[j]
+                stop_data[i] = all_stop_data[j]
+                next_program_idx_data[i] = all_next_program_idx_data[j]
+                next_arguments_data[i] = all_next_arguments_data[j]
+                sample_weight[i, :trace_lens[j]] = np.ones(trace_lens[j])
 
-    for epoch in range(num_epochs):
-        observation_data = np.zeros((samples_per_epoch, max_trace_len, *observation_shape))
-        arguments_data = np.zeros((samples_per_epoch, max_trace_len, num_arguments, argument_dim))
-        program_idx_data = np.zeros((samples_per_epoch, max_trace_len))
-        stop_data = np.zeros((samples_per_epoch, max_trace_len, 1))
-        next_program_idx_data = np.zeros((samples_per_epoch, max_trace_len, kv_memory_size))
-        next_arguments_data = np.zeros((samples_per_epoch, max_trace_len, num_arguments, argument_dim))
-        lstm_initial_state_data = np.zeros((samples_per_epoch, lstm_dim))
-        sample_weight = np.zeros((samples_per_epoch, max_trace_len))
+            # fit
+            model.fit([observation_data, arguments_data, program_idx_data, lstm_initial_state_data],
+                      [stop_data, next_program_idx_data, next_arguments_data],
+                      validation_data=(
+                      [all_observation_data[-num_val:], all_arguments_data[-num_val:], all_program_idx_data[-num_val:],
+                       all_lstm_initial_state_data[-num_val:]],
+                      [all_stop_data[-num_val:], all_next_program_idx_data[-num_val:],
+                       all_next_arguments_data[-num_val:]],
+                      [all_sample_weight[-num_val:]] * len(model.outputs)),
+                      epochs=epoch + 1, initial_epoch=epoch, batch_size=1, callbacks=callbacks, verbose=1,
+                      sample_weight=[sample_weight] * len(model.outputs))
 
-        # resample based on weight
-        sampled_idxs = [np.random.choice(range(num_train), p=avg_losses / sum(avg_losses)) for _ in range(samples_per_epoch)]
-        print('sampled indices/losses', list(zip(sampled_idxs[:10], avg_losses[sampled_idxs[:10]])))
+            all_metric_vals = np.zeros((len(examples), 1 + 2 * len(model.outputs)))
+            for i, trace_len in enumerate(trace_lens):
+                metric_vals = model.evaluate([all_observation_data[np.newaxis, i, :trace_len, :],
+                                              all_arguments_data[np.newaxis, i, :trace_len, :],
+                                              all_program_idx_data[np.newaxis, i, :trace_len],
+                                              all_lstm_initial_state_data[np.newaxis, i]],
+                                             [all_stop_data[np.newaxis, i, :trace_len],
+                                              all_next_program_idx_data[np.newaxis, i, :trace_len, :],
+                                              all_next_arguments_data[np.newaxis, i, :trace_len, :]],
+                                             verbose=0)
+                all_metric_vals[i] = metric_vals
 
-        for i, j in enumerate(sampled_idxs):
-            observation_data[i] = all_observation_data[j]
-            arguments_data[i] = all_arguments_data[j]
-            program_idx_data[i] = all_program_idx_data[j]
-            stop_data[i] = all_stop_data[j]
-            next_program_idx_data[i] = all_next_program_idx_data[j]
-            next_arguments_data[i] = all_next_arguments_data[j]
-            sample_weight[i, :trace_lens[j]] = np.ones(trace_lens[j])
+            # calculate the true accuracy because the padding skews it
+            # print('true train accuracy:', ' '.join('{}: {:.02f}'.format(name, acc) for name, acc in zip(model.output_names, np.mean(all_metric_vals[:num_train], axis=0)[-len(model.outputs):])))
+            # print('true val   accuracy:', ' '.join('{}: {:.02f}'.format(name, acc) for name, acc in zip(model.output_names, np.mean(all_metric_vals[-num_val:], axis=0)[-len(model.outputs):])))
 
-        # fit
-        model.fit([observation_data, arguments_data, program_idx_data, lstm_initial_state_data], [stop_data, next_program_idx_data, next_arguments_data],
+            # TODO: reenable after tf.keras callback hooks are deployed to pip
+            # loss_history = EpochLossHistory()
+            # model.evaluate([observation_data, arguments_data, program_idx_data],
+            #               [stop_data, next_program_idx_data, next_arguments_data],
+            #               batch_size=1, callbacks=[loss_history])
+            # for i in sampled_idxs:
+            #    avg_losses[i] = all_metric_vals[i, 0] / trace_lens[i]
+    else:
+        model.fit([all_observation_data[:num_train], all_arguments_data[:num_train], all_program_idx_data[:num_train], all_lstm_initial_state_data[:num_train]],
+                  [all_stop_data[:num_train], all_next_program_idx_data[:num_train], all_next_arguments_data[:num_train]],
                   validation_data=([all_observation_data[-num_val:], all_arguments_data[-num_val:], all_program_idx_data[-num_val:], all_lstm_initial_state_data[-num_val:]],
                                    [all_stop_data[-num_val:], all_next_program_idx_data[-num_val:], all_next_arguments_data[-num_val:]],
                                    [all_sample_weight[-num_val:]] * len(model.outputs)),
-                  epochs=epoch+1, initial_epoch=epoch, batch_size=1, callbacks=callbacks, verbose=1, sample_weight=[sample_weight] * len(model.outputs))
-
-        all_metric_vals = np.zeros((len(examples), 1 + 2 * len(model.outputs)))
-        for i, trace_len in enumerate(trace_lens):
-            metric_vals = model.evaluate([all_observation_data[np.newaxis, i, :trace_len, :], all_arguments_data[np.newaxis, i, :trace_len, :], all_program_idx_data[np.newaxis, i, :trace_len], all_lstm_initial_state_data[np.newaxis, i]],
-                                         [all_stop_data[np.newaxis, i, :trace_len], all_next_program_idx_data[np.newaxis, i, :trace_len, :], all_next_arguments_data[np.newaxis, i, :trace_len, :]],
-                                          verbose=0)
-            all_metric_vals[i] = metric_vals
-
-        # calculate the true accuracy because the padding skews it
-        #print('true train accuracy:', ' '.join('{}: {:.02f}'.format(name, acc) for name, acc in zip(model.output_names, np.mean(all_metric_vals[:num_train], axis=0)[-len(model.outputs):])))
-        #print('true val   accuracy:', ' '.join('{}: {:.02f}'.format(name, acc) for name, acc in zip(model.output_names, np.mean(all_metric_vals[-num_val:], axis=0)[-len(model.outputs):])))
-
-        # TODO: reenable after tf.keras callback hooks are deployed to pip
-        #loss_history = EpochLossHistory()
-        #model.evaluate([observation_data, arguments_data, program_idx_data],
-        #               [stop_data, next_program_idx_data, next_arguments_data],
-        #               batch_size=1, callbacks=[loss_history])
-        #for i in sampled_idxs:
-        #    avg_losses[i] = all_metric_vals[i, 0] / trace_lens[i]
+                  epochs=num_epochs, batch_size=batch_size, callbacks=callbacks, verbose=1, sample_weight=[all_sample_weight[:num_train]] * len(model.outputs),
+                  steps_per_epoch=None)
 
     # save model
     encoder.save(args.encoder_out)
     npi_core.save(args.npi_core_out)
-
 
 if __name__ == '__main__':
     main()
